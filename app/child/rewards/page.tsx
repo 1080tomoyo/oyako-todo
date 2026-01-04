@@ -18,12 +18,19 @@ import { notifications } from "@mantine/notifications";
 import { supabase } from "@/lib/supabaseClient";
 import ChildSwitcher from "@/app/(components)/ChildSwitcher";
 
+/**
+ * 子ども 1人分（表示に必要な最小項目）
+ */
 type Child = {
   id: string;
   name: string;
   points: number;
 };
 
+/**
+ * ごほうび 1件分（表示に必要な項目）
+ * - child_id は「子ども専用」の紐づけに使用（共通ごほうびは使わない方針）
+ */
 type Reward = {
   id: number;
   parent_id: string;
@@ -32,13 +39,14 @@ type Reward = {
   required_points: number;
   image_url: string | null;
   is_active: boolean;
-  child_id?: string | null;
+  child_id: string | null;
 };
 
 /**
  * 子ども用 ごほうび一覧ページ
- * - 子どもを切り替えながら、現在のポイントと交換可能なごほうびを確認できる
- * - ポイント不足時は交換不可とし、視覚的に状態を分かりやすく表示
+ * - 子どもを切り替えながら、現在ポイントと「交換できる/できない」を確認できる
+ * - 交換リクエストは pending で登録（親が承認する運用）
+ * - ローディング / 空状態 / 一覧表示を明確に分岐
  */
 export default function ChildRewardsPage() {
   // 初期データ取得中の表示制御
@@ -47,18 +55,18 @@ export default function ChildRewardsPage() {
   // ログイン中の親に紐づく子ども一覧
   const [children, setChildren] = useState<Child[]>([]);
 
-  // 現在選択されている子どもID
+  // 現在選択されている子どもID（未選択の場合は ""）
   const [selectedChildId, setSelectedChildId] = useState<string>("");
 
-  // 表示対象のごほうび一覧
+  // 表示対象のごほうび一覧（親配下の有効なもの）
   const [rewards, setRewards] = useState<Reward[]>([]);
 
-  // 子どもID -> 現在ポイント の参照用マップ
+  // 子どもID -> 現在ポイント（表示用に即参照できるよう map 化）
   const [pointsMap, setPointsMap] = useState<Record<string, number>>({});
 
   /**
    * 選択中の子どもの現在ポイント
-   * - selectedChildId が未選択の場合は 0 とする
+   * - 未選択時は 0 とする
    */
   const currentPoints = useMemo(() => {
     if (!selectedChildId) return 0;
@@ -66,8 +74,8 @@ export default function ChildRewardsPage() {
   }, [pointsMap, selectedChildId]);
 
   /**
-   * 選択中の子どもに紐づくごほうびのみを抽出
-   * - 子ども未選択時は空配列
+   * 選択中の子どもに紐づくごほうびのみを表示
+   * ※ 共通ごほうび（child_id=null）はこのアプリでは利用しない方針
    */
   const visibleRewards = useMemo(() => {
     if (!selectedChildId) return [];
@@ -81,19 +89,26 @@ export default function ChildRewardsPage() {
       // 現在ログインしている親ユーザーを取得
       const {
         data: { user },
+        error: userErr,
       } = await supabase.auth.getUser();
 
-      if (!user) {
+      // 未ログイン時は保護ページ想定のため、空で終了
+      if (userErr || !user) {
+        setChildren([]);
+        setRewards([]);
+        setSelectedChildId("");
+        setPointsMap({});
         setLoading(false);
         return;
       }
 
-      // 子ども一覧を取得（ポイント含む）
+      // 子ども一覧（ポイント含む）を取得（親 user_id で絞り込み）
       const { data: childrenData, error: childErr } = await supabase
         .from("children")
         .select("id, name, points")
         .eq("user_id", user.id);
 
+      // 取得失敗時は安全側に倒す
       if (childErr) {
         alert("こどもの じょうほうが とれなかったよ");
         setLoading(false);
@@ -103,12 +118,24 @@ export default function ChildRewardsPage() {
       const list = (childrenData ?? []) as Child[];
       setChildren(list);
 
+      // 子ども未登録時：選択IDが localStorage に残って混乱するためリセットする
+      if (list.length === 0) {
+        setSelectedChildId("");
+        setPointsMap({});
+        setRewards([]);
+        try {
+          localStorage.removeItem("child_selected_child_id");
+        } catch {}
+        setLoading(false);
+        return;
+      }
+
       // 子どもごとのポイントを即時参照できるよう map 化
       const pm: Record<string, number> = {};
       list.forEach((c) => (pm[c.id] = c.points ?? 0));
       setPointsMap(pm);
 
-      // 有効なごほうびのみを取得（表示用）
+      // 有効なごほうびのみを取得（親配下のみ）
       const { data: rewardsData, error: rewardsErr } = await supabase
         .from("rewards")
         .select("*")
@@ -116,8 +143,10 @@ export default function ChildRewardsPage() {
         .eq("is_active", true)
         .order("created_at", { ascending: false });
 
+      // 取得失敗時は空表示にする
       if (rewardsErr) {
         alert("ごほうびが とれなかったよ");
+        setRewards([]);
         setLoading(false);
         return;
       }
@@ -126,16 +155,17 @@ export default function ChildRewardsPage() {
       setLoading(false);
     };
 
-    // 初回マウント時のみデータ取得
+    // 初回マウント時のみ取得
     load();
   }, []);
 
   /**
    * ごほうび交換処理
    * - 子ども未選択 / ポイント不足時は事前にガード
-   * - 交換リクエストは pending 状態で登録
+   * - 交換は pending で登録（親が承認する運用）
    */
   const exchangeReward = async (reward: Reward) => {
+    // 子ども未選択の場合は先に選択を促す
     if (!selectedChildId) {
       notifications.show({
         message: "だれの がめんにする？ えらんでね",
@@ -144,6 +174,7 @@ export default function ChildRewardsPage() {
       return;
     }
 
+    // ポイント不足時は交換不可
     const current = pointsMap[selectedChildId] ?? 0;
     if (current < reward.required_points) {
       notifications.show({
@@ -153,6 +184,7 @@ export default function ChildRewardsPage() {
       return;
     }
 
+    // 交換リクエストを登録（pending）
     const { error } = await supabase.from("reward_redemptions").insert({
       child_id: selectedChildId,
       reward_id: reward.id,
@@ -164,6 +196,7 @@ export default function ChildRewardsPage() {
       return;
     }
 
+    // 成功通知（ポイント減算は親承認後に行う想定）
     notifications.show({
       title: "こうかん したよ！",
       message: reward.title,
@@ -188,7 +221,7 @@ export default function ChildRewardsPage() {
         />
       </Center>
 
-      {/* 現在のポイント表示 */}
+      {/* 現在ポイント表示 */}
       <Group justify="center" mt="lg">
         <Text fw={700} c="var(--oyako-text)">
           {!selectedChildId
@@ -198,27 +231,22 @@ export default function ChildRewardsPage() {
       </Group>
 
       {loading ? (
-        // 初期ロード中
+        // データ取得中は中央に Loader を表示
         <Group justify="center" mt="md">
           <Loader />
         </Group>
       ) : (
         <Stack mt="md">
           {visibleRewards.map((r) => {
-            // 現在のポイントで交換可能かどうか
+            // 現在ポイントで交換可能かどうか
             const canExchange =
-              selectedChildId &&
               (pointsMap[selectedChildId] ?? 0) >= r.required_points;
 
-            // 交換に必要な残りポイント
-            const remain =
-              selectedChildId
-                ? Math.max(
-                    0,
-                    r.required_points -
-                      (pointsMap[selectedChildId] ?? 0)
-                  )
-                : null;
+            // 交換に必要な残りポイント（表示用）
+            const remain = Math.max(
+              0,
+              r.required_points - (pointsMap[selectedChildId] ?? 0)
+            );
 
             return (
               <Card key={String(r.id)} withBorder shadow="sm" p="md">
@@ -255,16 +283,14 @@ export default function ChildRewardsPage() {
                           {r.required_points} ぽいんと
                         </Badge>
 
-                        {selectedChildId && (
-                          <Badge
-                            color={canExchange ? "green" : "gray"}
-                            variant="light"
-                          >
-                            {canExchange
-                              ? "こうかん できる！"
-                              : `あと ${remain} ぽいんと`}
-                          </Badge>
-                        )}
+                        <Badge
+                          color={canExchange ? "green" : "gray"}
+                          variant="light"
+                        >
+                          {canExchange
+                            ? "こうかん できる！"
+                            : `あと ${remain} ぽいんと`}
+                        </Badge>
                       </Group>
 
                       {r.description && (
@@ -290,12 +316,12 @@ export default function ChildRewardsPage() {
             );
           })}
 
-          {/* ごほうびが存在しない場合の空状態 */}
+          {/* 空状態（子ども未選択 / ごほうび未登録） */}
           {visibleRewards.length === 0 && (
             <Card withBorder shadow="sm" p="md">
               <Text c="dimmed">
                 {!selectedChildId
-                  ? "だれの がめんにする？"
+                  ? "まずは「マイページ」で子どもを登録してください。"
                   : "ごほうびが ないよ"}
               </Text>
             </Card>
