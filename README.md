@@ -41,8 +41,7 @@
 - `/child/redemptions` : 申請履歴
 
 ### 認証
-- `/signin`
-- `/signup`
+- `/signin` : ログイン / 新規登録
 
 ---
 
